@@ -1,4 +1,4 @@
-"""API FastAPI: PDF → Markdown (1ª página) via Marker."""
+"""API FastAPI: PDF → Markdown (1ª página) via PyMuPDF4LLM + RapidOCR."""
 
 from __future__ import annotations
 
@@ -15,12 +15,12 @@ from pydantic import BaseModel, Field
 
 from app.auth import require_token
 from app.config import Settings, get_settings
-from app.converter import MarkerConverter
+from app.converter import DocumentConverter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-_converter: MarkerConverter | None = None
+_converter: DocumentConverter | None = None
 _executor = ThreadPoolExecutor(max_workers=1)
 
 _ALLOWED_CONTENT_TYPES = {
@@ -50,9 +50,15 @@ async def lifespan(app: FastAPI):
             "API_TOKEN vazio — POST /ocr retornará 503 até configurar o .env"
         )
 
-    os_device = settings.torch_device
-    logger.info("Inicializando Marker (TORCH_DEVICE=%s)", os_device)
-    _converter = MarkerConverter(device=os_device)
+    logger.info(
+        "Inicializando conversor (ocr_dpi=%s force_ocr=%s)",
+        settings.ocr_dpi,
+        settings.force_ocr,
+    )
+    _converter = DocumentConverter(
+        ocr_dpi=settings.ocr_dpi,
+        force_ocr=settings.force_ocr,
+    )
     yield
     _executor.shutdown(wait=False, cancel_futures=True)
     _converter = None
@@ -62,15 +68,15 @@ app = FastAPI(
     title="OCR PDF → Markdown",
     description=(
         "Converte a primeira página de um PDF (digital, com imagens ou escaneado) "
-        "em Markdown usando Marker em CPU. "
+        "em Markdown com PyMuPDF4LLM. OCR automático via RapidOCR (ONNX) em CPU. "
         "Envie o conteúdo binário do PDF no body (ex.: bytes baixados do S3)."
     ),
-    version="1.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
 
-def get_converter() -> MarkerConverter:
+def get_converter() -> DocumentConverter:
     if _converter is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -106,7 +112,7 @@ async def health() -> HealthResponse:
 async def ocr(
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
-    converter: Annotated[MarkerConverter, Depends(get_converter)],
+    converter: Annotated[DocumentConverter, Depends(get_converter)],
     filename: Annotated[
         str,
         Query(description="Nome opcional do arquivo (apenas metadado na resposta)"),

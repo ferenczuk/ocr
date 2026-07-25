@@ -1,10 +1,12 @@
-# OCR PDF → Markdown (Marker + CPU)
+# OCR PDF → Markdown (PyMuPDF4LLM + RapidOCR)
 
-API em **FastAPI + Uvicorn** que recebe um PDF via `POST`, processa **somente a primeira página** com **Marker** (OCR via Surya) e devolve o conteúdo em **Markdown**.
+API em **FastAPI + Uvicorn** que recebe um PDF via `POST`, processa **somente a primeira página** e devolve **Markdown**.
 
-Funciona com PDFs digitais, com imagens e **escaneados** (`force_ocr` ativo). O runtime é focada em **CPU**.
+Stack leve em **CPU**, voltada a documentos contábeis:
 
-> **Licença:** o Marker usa código GPL e pesos com restrições comerciais. Avalie a [licença do projeto](https://github.com/datalab-to/marker) antes de uso comercial.
+1. **PyMuPDF4LLM** — layout → Markdown (títulos, colunas, tabelas básicas)
+2. Texto digital quando a página já tem camada de texto (melhor para CNPJ/valores)
+3. **RapidOCR** (ONNX) automático em scans/imagens — **sem Tesseract** e sem Marker/PyTorch
 
 ---
 
@@ -13,19 +15,22 @@ Funciona com PDFs digitais, com imagens e **escaneados** (`force_ocr` ativo). O 
 | Comportamento | Detalhe |
 |---|---|
 | Entrada | Conteúdo binário do PDF no body (`application/pdf`) — ideal após baixar do S3 |
-| Páginas | **Apenas a página 1** (índice `0`), mesmo em PDFs longos |
-| OCR | Forçado — lê texto de scans e regiões com imagem |
+| Páginas | **Apenas a página 1** (`pages=[0]`) |
+| Digital | Extração nativa via PyMuPDF4LLM |
+| Scan | OCR automático com plugin RapidOCR |
 | Saída | JSON com o Markdown da página |
-| Auth | Token único definido no `.env` (`Authorization: Bearer ...`) |
-| Hardware | CPU (`TORCH_DEVICE=cpu`) |
+| Auth | Token único no `.env` (`Authorization: Bearer ...`) |
+| Hardware | CPU |
 
 ---
 
 ## Requisitos
 
 - [Docker](https://docs.docker.com/get-docker/) e [Docker Compose](https://docs.docker.com/compose/)
-- Máquina com **pelo menos 8 GB de RAM** recomendados (Marker em CPU é pesado)
-- Espaço em disco para baixar os modelos na primeira execução (alguns GB)
+- **≥ 2 GB de RAM** recomendados
+- Na primeira execução o RapidOCR pode baixar modelos ONNX (cache no volume Docker)
+
+> **Licença:** PyMuPDF/PyMuPDF4LLM usam licença AGPL (uso comercial fechado pode exigir licença Artifex).
 
 ---
 
@@ -38,63 +43,39 @@ git clone git@github.com:ferenczuk/ocr.git
 cd ocr
 ```
 
-(Ajuste a URL se o remote for outro.)
-
 ### 2. Configurar o `.env`
 
 ```bash
 cp .env.example .env
+openssl rand -hex 32   # cole em API_TOKEN
 ```
 
-Edite o arquivo `.env` e defina um token forte:
-
-```bash
-# Gere um token aleatório
-openssl rand -hex 32
-```
-
-Exemplo de `.env`:
+Exemplo:
 
 ```env
 API_TOKEN=cole_aqui_o_token_gerado
-TORCH_DEVICE=cpu
 MAX_UPLOAD_MB=50
 PORT=8000
+OCR_DPI=250
+FORCE_OCR=false
 ```
 
-> Sem `API_TOKEN` válido, o endpoint `/ocr` recusa as requisições.
-
-### 3. Subir com Docker Compose
+### 3. Subir
 
 ```bash
 docker compose up -d --build
 ```
 
-Na **primeira** subida o container pode demorar: o Marker baixa os modelos de OCR/layout. Os arquivos ficam no volume `marker_cache` e não precisam ser baixados de novo.
-
-### 4. Verificar se está no ar
+### 4. Health check
 
 ```bash
 curl http://localhost:8000/health
+# {"status":"ok"}
 ```
 
-Resposta esperada:
-
-```json
-{"status":"ok"}
-```
-
-Swagger interativo (opcional):
-
-```text
-http://localhost:8000/docs
-```
-
-### 5. Parar / reiniciar
+Swagger: `http://localhost:8000/docs`
 
 ```bash
-docker compose down
-docker compose up -d
 docker compose logs -f ocr
 ```
 
@@ -104,26 +85,23 @@ docker compose logs -f ocr
 
 | Variável | Obrigatória | Padrão | Descrição |
 |---|---|---|---|
-| `API_TOKEN` | **Sim** | — | Token Bearer para autenticar `POST /ocr` |
-| `TORCH_DEVICE` | Não | `cpu` | Dispositivo PyTorch (`cpu` neste deploy) |
-| `MAX_UPLOAD_MB` | Não | `50` | Tamanho máximo do PDF em MB |
-| `PORT` | Não | `8000` | Porta publicada no host |
-
-O `docker-compose.yml` carrega o arquivo `.env` automaticamente (`env_file: .env`).
+| `API_TOKEN` | **Sim** | — | Token Bearer para `POST /ocr` |
+| `MAX_UPLOAD_MB` | Não | `50` | Limite do PDF em MB |
+| `PORT` | Não | `8000` | Porta no host |
+| `OCR_DPI` | Não | `250` | DPI do OCR (maior = mais preciso/lento) |
+| `FORCE_OCR` | Não | `false` | `true` força OCR mesmo com texto digital |
 
 ---
 
 ## Uso da API
 
-### Health check (sem autenticação)
+### Health (sem auth)
 
 ```bash
 curl -s http://localhost:8000/health
 ```
 
-### OCR — converter PDF (primeira página)
-
-Envie o **conteúdo binário** do PDF no body (por exemplo, os bytes baixados do S3). Não use `multipart/form-data`.
+### OCR (body binário)
 
 ```bash
 curl -X POST "http://localhost:8000/ocr?filename=documento.pdf" \
@@ -132,19 +110,14 @@ curl -X POST "http://localhost:8000/ocr?filename=documento.pdf" \
   --data-binary @documento.pdf
 ```
 
-Substitua `SEU_TOKEN` pelo valor de `API_TOKEN` do `.env`.
-
-O query param `filename` é opcional (só aparece na resposta como metadado).
-
-#### Exemplo com bytes do S3 (Python)
+#### Python (S3)
 
 ```python
 import boto3
 import requests
 
 s3 = boto3.client("s3")
-obj = s3.get_object(Bucket="meu-bucket", Key="pasta/arquivo.pdf")
-pdf_bytes = obj["Body"].read()
+pdf_bytes = s3.get_object(Bucket="meu-bucket", Key="pasta/arquivo.pdf")["Body"].read()
 
 resp = requests.post(
     "http://localhost:8000/ocr",
@@ -154,75 +127,63 @@ resp = requests.post(
         "Content-Type": "application/pdf",
     },
     data=pdf_bytes,
+    timeout=120,
 )
 print(resp.json()["markdown"])
 ```
 
-#### Resposta de sucesso (`200`)
+#### Resposta (`200`)
 
 ```json
 {
-  "markdown": "# Título extraído\n\nTexto da primeira página...",
+  "markdown": "# Título\n\nTexto da primeira página...",
   "filename": "documento.pdf",
   "pages_processed": [0]
 }
 ```
 
-#### Erros comuns
-
 | HTTP | Situação |
 |---|---|
-| `401` | Token ausente ou inválido |
-| `400` | Body vazio / conteúdo não é PDF |
-| `413` | Conteúdo maior que `MAX_UPLOAD_MB` |
-| `415` | `Content-Type` diferente de PDF/octet-stream |
-| `500` | Falha interna do Marker ao processar |
-| `503` | `API_TOKEN` não configurado ou conversor ainda iniciando |
+| `401` | Token ausente/inválido |
+| `400` | Body vazio / não é PDF |
+| `413` | Maior que `MAX_UPLOAD_MB` |
+| `415` | Content-Type inválido |
+| `500` | Falha ao processar |
+| `503` | Token não configurado / conversor iniciando |
 
 ---
 
-## Comportamento do OCR
+## Comportamento
 
-1. **Só a primeira página** — páginas seguintes são ignoradas de propósito (menor custo de CPU/RAM).
-2. **OCR forçado** — adequado para PDFs escaneados e páginas cujo texto está embutido em imagem.
-3. **Markdown estruturado** — o Marker preserva o máximo possível de títulos, parágrafos, tabelas e layout.
-4. **Imagens** — o texto contido nas imagens da página é reconhecido via OCR; arquivos de imagem embutidos **não** são retornados na resposta (apenas o Markdown).
+1. Só a **1ª página**
+2. Markdown com **layout** (PyMuPDF4LLM)
+3. OCR **só quando necessário** (scan / pouco texto); `FORCE_OCR=true` força sempre
+4. Motor de OCR fixado em **RapidOCR** (não usa Tesseract)
 
-Tempo típico em CPU: da ordem de **segundos a dezenas de segundos** por página, conforme complexidade e hardware.
+Tempo típico em CPU: **segundos** por página.
 
 ---
 
 ## Troubleshooting
 
-### `401 Token inválido` / `Token ausente`
+### `401`
 
-- Confirme o header: `Authorization: Bearer <mesmo valor do API_TOKEN>`
-- Não use aspas extras no `.env`
-- Após alterar o `.env`, reinicie: `docker compose up -d`
+Confirme `Authorization: Bearer <API_TOKEN>` e reinicie após mudar o `.env`.
 
-### Container demora ou parece “travado” no primeiro start
+### Timeout no cliente
 
-- Normal na primeira execução (download dos modelos). Acompanhe:
-
-```bash
-docker compose logs -f ocr
+```php
+Http::timeout(120)
 ```
 
-- O healthcheck tem `start_period` alto (~3 min) por causa disso.
+### OCR ruim em scan
 
-### Erro de memória (OOM / killed)
+- Suba `OCR_DPI` (ex.: `300`)
+- Se o PDF digital tiver texto “lixo”, teste `FORCE_OCR=true`
 
-- Aumente a RAM da máquina (recomendado ≥ 8 GB)
-- Reduza `MAX_UPLOAD_MB` e envie PDFs menores
-- Evite enviar PDFs muito pesados (mesmo lendo só a 1ª página, o body inteiro é carregado em memória)
+### OOM
 
-### Porta já em uso
-
-Altere `PORT` no `.env`, por exemplo `PORT=8080`, e suba de novo:
-
-```bash
-docker compose up -d
-```
+- Reduza `OCR_DPI` (ex.: `200`) e `MAX_UPLOAD_MB`
 
 ### Rebuild limpo
 
@@ -234,30 +195,27 @@ docker compose up -d
 
 ---
 
-## Desenvolvimento local (opcional)
-
-Se preferir rodar fora do Docker (ainda em CPU):
+## Desenvolvimento local
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
-cp .env.example .env   # configure API_TOKEN
+cp .env.example .env
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 ---
 
-## Estrutura do projeto
+## Estrutura
 
 ```text
 ocr/
 ├── app/
-│   ├── main.py        # rotas /health e /ocr
-│   ├── converter.py   # Marker (página 0 + force_ocr)
-│   ├── auth.py        # Bearer token
-│   └── config.py      # settings do .env
+│   ├── main.py        # /health e /ocr
+│   ├── converter.py   # PyMuPDF4LLM + RapidOCR
+│   ├── auth.py
+│   └── config.py
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .env.example
@@ -267,11 +225,9 @@ ocr/
 
 ---
 
-## Exemplos de uso (PHP)
+## Exemplos PHP
 
-Os exemplos abaixo enviam o **conteúdo binário** do PDF no body (por exemplo, bytes baixados do S3).
-
-### PHP com GuzzleHTTP
+### GuzzleHTTP
 
 ```php
 <?php
@@ -281,16 +237,12 @@ require 'vendor/autoload.php';
 use GuzzleHttp\Client;
 
 $pdfBytes = file_get_contents('/caminho/para/documento.pdf');
-// Ou, com S3 (AWS SDK):
-// $result = $s3->getObject(['Bucket' => 'meu-bucket', 'Key' => 'pasta/arquivo.pdf']);
-// $pdfBytes = (string) $result['Body'];
 
 $client = new Client(['base_uri' => 'http://localhost:8000']);
 
 $response = $client->post('/ocr', [
-    'query' => [
-        'filename' => 'documento.pdf',
-    ],
+    'timeout' => 120,
+    'query' => ['filename' => 'documento.pdf'],
     'headers' => [
         'Authorization' => 'Bearer SEU_TOKEN',
         'Content-Type' => 'application/pdf',
@@ -310,11 +262,10 @@ echo $data['markdown'];
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
 
-// Bytes locais ou vindos do S3 (disk s3)
 $pdfBytes = Storage::disk('s3')->get('pasta/arquivo.pdf');
-// Ou: $pdfBytes = file_get_contents(storage_path('app/documento.pdf'));
 
-$response = Http::withToken(env('OCR_API_TOKEN'))
+$response = Http::timeout(120)
+    ->withToken(env('OCR_API_TOKEN'))
     ->withBody($pdfBytes, 'application/pdf')
     ->post('http://localhost:8000/ocr?filename=arquivo.pdf');
 
@@ -325,4 +276,4 @@ if ($response->failed()) {
 $markdown = $response->json('markdown');
 ```
 
-> No Laravel, `withToken()` envia `Authorization: Bearer ...`. Use `withBody($bytes, 'application/pdf')` e coloque `filename` na query da URL — não passe array no segundo argumento de `post()`, senão o body binário é sobrescrito.
+> Use `withBody(...)` e `filename` na query — não passe array no segundo argumento de `post()`.
