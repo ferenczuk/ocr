@@ -12,7 +12,7 @@ Funciona com PDFs digitais, com imagens e **escaneados** (`force_ocr` ativo). O 
 
 | Comportamento | Detalhe |
 |---|---|
-| Entrada | Arquivo PDF (`multipart/form-data`) |
+| Entrada | Conteúdo binário do PDF no body (`application/pdf`) — ideal após baixar do S3 |
 | Páginas | **Apenas a página 1** (índice `0`), mesmo em PDFs longos |
 | OCR | Forçado — lê texto de scans e regiões com imagem |
 | Saída | JSON com o Markdown da página |
@@ -123,13 +123,40 @@ curl -s http://localhost:8000/health
 
 ### OCR — converter PDF (primeira página)
 
+Envie o **conteúdo binário** do PDF no body (por exemplo, os bytes baixados do S3). Não use `multipart/form-data`.
+
 ```bash
-curl -X POST "http://localhost:8000/ocr" \
+curl -X POST "http://localhost:8000/ocr?filename=documento.pdf" \
   -H "Authorization: Bearer SEU_TOKEN" \
-  -F "file=@documento.pdf"
+  -H "Content-Type: application/pdf" \
+  --data-binary @documento.pdf
 ```
 
 Substitua `SEU_TOKEN` pelo valor de `API_TOKEN` do `.env`.
+
+O query param `filename` é opcional (só aparece na resposta como metadado).
+
+#### Exemplo com bytes do S3 (Python)
+
+```python
+import boto3
+import requests
+
+s3 = boto3.client("s3")
+obj = s3.get_object(Bucket="meu-bucket", Key="pasta/arquivo.pdf")
+pdf_bytes = obj["Body"].read()
+
+resp = requests.post(
+    "http://localhost:8000/ocr",
+    params={"filename": "arquivo.pdf"},
+    headers={
+        "Authorization": "Bearer SEU_TOKEN",
+        "Content-Type": "application/pdf",
+    },
+    data=pdf_bytes,
+)
+print(resp.json()["markdown"])
+```
 
 #### Resposta de sucesso (`200`)
 
@@ -146,8 +173,9 @@ Substitua `SEU_TOKEN` pelo valor de `API_TOKEN` do `.env`.
 | HTTP | Situação |
 |---|---|
 | `401` | Token ausente ou inválido |
-| `400` | Não é PDF / arquivo vazio |
-| `413` | Arquivo maior que `MAX_UPLOAD_MB` |
+| `400` | Body vazio / conteúdo não é PDF |
+| `413` | Conteúdo maior que `MAX_UPLOAD_MB` |
+| `415` | `Content-Type` diferente de PDF/octet-stream |
 | `500` | Falha interna do Marker ao processar |
 | `503` | `API_TOKEN` não configurado ou conversor ainda iniciando |
 
@@ -186,7 +214,7 @@ docker compose logs -f ocr
 
 - Aumente a RAM da máquina (recomendado ≥ 8 GB)
 - Reduza `MAX_UPLOAD_MB` e envie PDFs menores
-- Evite processar PDFs muito pesados (mesmo lendo só a 1ª página, o arquivo inteiro é enviado)
+- Evite enviar PDFs muito pesados (mesmo lendo só a 1ª página, o body inteiro é carregado em memória)
 
 ### Porta já em uso
 

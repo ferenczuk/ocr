@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from app.auth import require_token
@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 
 _converter: MarkerConverter | None = None
 _executor = ThreadPoolExecutor(max_workers=1)
+
+_ALLOWED_CONTENT_TYPES = {
+    "application/pdf",
+    "application/octet-stream",
+    "binary/octet-stream",
+}
 
 
 class HealthResponse(BaseModel):
@@ -56,7 +62,8 @@ app = FastAPI(
     title="OCR PDF → Markdown",
     description=(
         "Converte a primeira página de um PDF (digital, com imagens ou escaneado) "
-        "em Markdown usando Marker em CPU."
+        "em Markdown usando Marker em CPU. "
+        "Envie o conteúdo binário do PDF no body (ex.: bytes baixados do S3)."
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -82,36 +89,49 @@ async def health() -> HealthResponse:
     response_model=OcrResponse,
     dependencies=[Depends(require_token)],
     tags=["ocr"],
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/pdf": {
+                    "schema": {"type": "string", "format": "binary"}
+                },
+                "application/octet-stream": {
+                    "schema": {"type": "string", "format": "binary"}
+                },
+            },
+        }
+    },
 )
 async def ocr(
-    file: Annotated[UploadFile, File(description="Arquivo PDF")],
+    request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
     converter: Annotated[MarkerConverter, Depends(get_converter)],
+    filename: Annotated[
+        str,
+        Query(description="Nome opcional do arquivo (apenas metadado na resposta)"),
+    ] = "document.pdf",
 ) -> OcrResponse:
-    filename = file.filename or "document.pdf"
-    if not filename.lower().endswith(".pdf"):
+    content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if content_type and content_type not in _ALLOWED_CONTENT_TYPES:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Envie um arquivo com extensão .pdf",
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=(
+                "Content-Type inválido. Envie application/pdf ou "
+                "application/octet-stream com o binário do PDF no body."
+            ),
         )
 
-    content_type = (file.content_type or "").lower()
-    if content_type and content_type not in (
-        "application/pdf",
-        "application/octet-stream",
-        "binary/octet-stream",
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Content-Type inválido: {file.content_type}",
-        )
+    if not filename.lower().endswith(".pdf"):
+        filename = f"{filename}.pdf"
 
     max_bytes = settings.max_upload_mb * 1024 * 1024
-    data = await file.read()
+    data = await request.body()
+
     if not data:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Arquivo vazio",
+            detail="Body vazio — envie o conteúdo binário do PDF",
         )
     if len(data) > max_bytes:
         raise HTTPException(
@@ -121,7 +141,7 @@ async def ocr(
     if not data.startswith(b"%PDF"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="O arquivo não parece ser um PDF válido",
+            detail="O conteúdo não parece ser um PDF válido",
         )
 
     tmp_path: Path | None = None
