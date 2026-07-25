@@ -264,3 +264,65 @@ ocr/
 ├── requirements.txt
 └── README.md
 ```
+
+---
+
+## Exemplos de uso (PHP)
+
+Os exemplos abaixo enviam o **conteúdo binário** do PDF no body (por exemplo, bytes baixados do S3).
+
+### PHP com GuzzleHTTP
+
+```php
+<?php
+
+require 'vendor/autoload.php';
+
+use GuzzleHttp\Client;
+
+$pdfBytes = file_get_contents('/caminho/para/documento.pdf');
+// Ou, com S3 (AWS SDK):
+// $result = $s3->getObject(['Bucket' => 'meu-bucket', 'Key' => 'pasta/arquivo.pdf']);
+// $pdfBytes = (string) $result['Body'];
+
+$client = new Client(['base_uri' => 'http://localhost:8000']);
+
+$response = $client->post('/ocr', [
+    'query' => [
+        'filename' => 'documento.pdf',
+    ],
+    'headers' => [
+        'Authorization' => 'Bearer SEU_TOKEN',
+        'Content-Type' => 'application/pdf',
+    ],
+    'body' => $pdfBytes,
+]);
+
+$data = json_decode((string) $response->getBody(), true);
+echo $data['markdown'];
+```
+
+### Laravel HTTP
+
+```php
+<?php
+
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Storage;
+
+// Bytes locais ou vindos do S3 (disk s3)
+$pdfBytes = Storage::disk('s3')->get('pasta/arquivo.pdf');
+// Ou: $pdfBytes = file_get_contents(storage_path('app/documento.pdf'));
+
+$response = Http::withToken(env('OCR_API_TOKEN'))
+    ->withBody($pdfBytes, 'application/pdf')
+    ->post('http://localhost:8000/ocr?filename=arquivo.pdf');
+
+if ($response->failed()) {
+    throw new RuntimeException('OCR falhou: ' . $response->body());
+}
+
+$markdown = $response->json('markdown');
+```
+
+> No Laravel, `withToken()` envia `Authorization: Bearer ...`. Use `withBody($bytes, 'application/pdf')` e coloque `filename` na query da URL — não passe array no segundo argumento de `post()`, senão o body binário é sobrescrito.
