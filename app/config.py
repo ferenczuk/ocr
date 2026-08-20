@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     # force_ocr=True aplica OCR mesmo com texto digital (mais lento)
     force_ocr: bool = False
 
+    # OpenAI (usado por POST /to-xlsx)
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o-mini"
+    openai_timeout_seconds: int = 120
+    openai_max_chars: int = 100_000
+
 
 @lru_cache
 def get_settings() -> Settings:
