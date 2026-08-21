@@ -50,21 +50,19 @@ def structure_data(
     openai_max_chars: int,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """Retorna (columns, rows)."""
-    need_ai = schema_mode == "ia" or not extraction.structured or not extraction.records
+    # Extratores estruturados (OFX, CNAB, etc.) não devem cair na IA só porque
+    # vieram 0 lançamentos — devolve planilha vazia com as colunas pedidas.
+    if schema_mode == "custom" and extraction.structured:
+        rows = [_project_row(r, columns) for r in extraction.records]
+        rows = [r for r in rows if _row_has_content(r)]
+        return columns, _validate_rows(rows, columns)
 
-    if schema_mode == "custom":
-        # Colunas custom: se já structured, remap; senão IA
-        if extraction.structured and extraction.records:
-            rows = [_project_row(r, columns) for r in extraction.records]
-            rows = [r for r in rows if _row_has_content(r)]
-            if rows:
-                return columns, _validate_rows(rows, columns)
-        need_ai = True
-
-    if schema_mode == "fixed" and extraction.structured and extraction.records:
+    if schema_mode == "fixed" and extraction.structured:
         rows = [_project_row(r, FIXED_COLUMNS) for r in extraction.records]
         rows = [r for r in rows if _row_has_content(r)]
         return list(FIXED_COLUMNS), _validate_rows(rows, FIXED_COLUMNS)
+
+    need_ai = schema_mode == "ia" or not extraction.structured or not extraction.records
 
     if need_ai:
         if not openai_api_key:
